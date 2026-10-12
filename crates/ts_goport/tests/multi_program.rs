@@ -214,19 +214,51 @@ fn reused_version_tables_equal_a_full_build() {
     );
 }
 
+/// `goport_multiprog rebuilds`: an embedder that builds a new frontend
+/// program of the whole project for each version and calls
+/// `program::mark_freeable_parses` frees every file version once no program
+/// has it, as `tsc --watch` does. Each rebuild parses the four files of the
+/// fixture again, and each of these parses is of a path that an earlier
+/// version published. Each report equals the report of the last version
+/// with the same text (`rebuilds` checks it). With the flag unset, the
+/// process makes no file version and frees nothing.
+// PORT: no Go counterpart.
+#[test]
+fn embedder_rebuilds_free_file_versions() {
+    const REBUILDS: usize = 4;
+    const FILES: usize = 4;
+    let (made, dead) = run_multiprog("rebuilds", "rebuilds-default", REBUILDS, &[]);
+    assert_eq!((made, dead), (0, 0), "a CLI process makes no file version");
+    let (made, dead) = run_multiprog("rebuilds", "rebuilds-free", REBUILDS, FREE_FILE_VERSIONS);
+    assert!(
+        made >= REBUILDS * FILES,
+        "each rebuild parses every file of the fixture again, so it makes a file version of each (made {made})"
+    );
+    assert_eq!(
+        dead, made,
+        "a file version outlives every program that had it (a missed holder)"
+    );
+}
+
 /// Runs `goport_multiprog cycles` `count` times on a new copy of the fixture
 /// with `env` set, and gives the numbers of its last line,
 /// `file_versions made=<n> dead=<m>`. `GOPORT_FREE_FILE_VERSIONS` is unset
 /// unless `env` sets it, so the test environment does not change the
 /// default.
 fn run_cycles(test: &str, count: usize, env: &[(&str, &str)]) -> (usize, usize) {
+    run_multiprog("cycles", test, count, env)
+}
+
+/// `run_cycles` for the `goport_multiprog` mode `mode` (`cycles` or
+/// `rebuilds`).
+fn run_multiprog(mode: &str, test: &str, count: usize, env: &[(&str, &str)]) -> (usize, usize) {
     let root = scratch_dir(test);
     let project = root.join("project");
     copy_dir(Path::new(FIXTURE), &project);
     let changed = project.join(CHANGED);
     let original = read(&changed);
     let run = Command::new(env!("CARGO_BIN_EXE_goport_multiprog"))
-        .arg("cycles")
+        .arg(mode)
         .arg("tsconfig.json")
         .arg(norm(&changed))
         .arg(count.to_string())
@@ -238,19 +270,19 @@ fn run_cycles(test: &str, count: usize, env: &[(&str, &str)]) -> (usize, usize) 
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
     assert!(
         run.status.success(),
-        "goport_multiprog cycles failed ({}) in {}:\n{stdout}\n{}",
+        "goport_multiprog {mode} failed ({}) in {}:\n{stdout}\n{}",
         run.status,
         root.display(),
         String::from_utf8_lossy(&run.stderr)
     );
-    assert_eq!(read(&changed), original, "cycles must restore {CHANGED}");
+    assert_eq!(read(&changed), original, "{mode} must restore {CHANGED}");
     let counts = stdout
         .lines()
         .last()
         .and_then(|line| line.strip_prefix("file_versions made="))
         .and_then(|rest| rest.split_once(" dead="))
         .and_then(|(made, dead)| Some((made.parse().ok()?, dead.parse().ok()?)))
-        .unwrap_or_else(|| panic!("no file_versions line in the cycles output:\n{stdout}"));
+        .unwrap_or_else(|| panic!("no file_versions line in the {mode} output:\n{stdout}"));
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
     counts
 }

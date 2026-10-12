@@ -24,7 +24,18 @@
 //! unless `GOPORT_FREE_FILE_VERSIONS=1`, which gives each new parse of the
 //! changed file a freeable version, as the language server does.
 //!
-//! Both modes put the original text back into the changed file at the end,
+//! `rebuilds <tsconfig> <changed-file> <count>` edits the changed file as
+//! `cycles` does, but makes each version as a multi-program embedder that
+//! builds its own frontend program does: it parses the config again, makes
+//! a new compiler host and `new_program`, calls
+//! `program::mark_freeable_parses` and makes the version with
+//! `new_program_version(&np, None)`. So each version parses every file
+//! again. It prints `rebuild <i> rss_kb=<VmRSS> hwm_kb=<VmHWM>` and the same
+//! `file_versions` line as `cycles`. With `GOPORT_FREE_FILE_VERSIONS=1`,
+//! each parse of a file that an earlier version published is a freeable
+//! version.
+//!
+//! All modes put the original text back into the changed file at the end,
 //! also after a failed check. A failed check or an unported hit panics.
 //! Exit codes: 0 when every check passes, 1 when one fails, 2 for a usage
 //! error.
@@ -36,11 +47,16 @@ use ts_goport::execute::tsc::{
     CompileTimes, CompilerProgram, EmitInput, Writer, create_diagnostic_reporter,
     create_report_error_summary, emit_and_report_statistics, new_os_system,
 };
+use ts_goport::frontend::bundled;
+use ts_goport::frontend::compiler::{ProgramOptions, new_compiler_host, new_program};
+use ts_goport::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
 use ts_goport::frontend::tspath::{normalize_path, resolve_path};
+use ts_goport::frontend::vfs::{Fs, osvfs_fs};
 use ts_goport::prelude::*;
 
 const USAGE: &str = "usage: goport_multiprog pair <tsconfig> <changed-file> <new-text-file> <out-dir> [--first <other-tsconfig>]
-       goport_multiprog cycles <tsconfig> <changed-file> <count>";
+       goport_multiprog cycles <tsconfig> <changed-file> <count>
+       goport_multiprog rebuilds <tsconfig> <changed-file> <count>";
 
 /// The comment line that `cycles` adds and removes.
 const CYCLE_LINE: &str = "\n// goport_multiprog cycle\n";
@@ -86,6 +102,10 @@ fn run(args: &[String]) -> Result<(), String> {
         ["cycles", config, changed, count] if first.is_none() => {
             let count = count.parse().map_err(|_| format!("bad count {count}"))?;
             cycles(config, changed, count);
+        }
+        ["rebuilds", config, changed, count] if first.is_none() => {
+            let count = count.parse().map_err(|_| format!("bad count {count}"))?;
+            rebuilds(config, changed, count);
         }
         _ => return Err(format!("wrong arguments {args:?}")),
     }
@@ -241,6 +261,95 @@ fn cycles(config: &str, changed: &str, count: usize) {
         dead_file_versions()
     );
     drop(restore);
+}
+
+/// The `rebuilds` mode: `cycles` with a new frontend program of the whole
+/// project for each version (`rebuild`).
+fn rebuilds(config: &str, changed: &str, count: usize) {
+    let restore = Restore::new(changed);
+    let edited = format!("{}{CYCLE_LINE}", restore.text);
+    let mut current = rebuild(config);
+    // The reports of the original and the edited text, by `i % 2`.
+    let mut reports = [Some(report(current)), None];
+    for i in 1..=count {
+        let text = if i % 2 == 1 { &edited } else { &restore.text };
+        write(Path::new(changed), text.as_bytes());
+        let next = rebuild(config);
+        let next_report = report(next);
+        match &reports[i % 2] {
+            Some(expected) => assert!(
+                *expected == next_report,
+                "rebuild {i}: the report differs from the last version with the same text"
+            ),
+            None => reports[i % 2] = Some(next_report),
+        }
+        release_program(current);
+        current = next;
+        let (rss, hwm) = memory_kb();
+        println!("rebuild {i} rss_kb={rss} hwm_kb={hwm}");
+    }
+    release_program(current);
+    println!(
+        "file_versions made={} dead={}",
+        file_versions_made(),
+        dead_file_versions()
+    );
+    drop(restore);
+}
+
+/// The file system and current directory that `rebuild` reads the config
+/// with.
+struct ConfigHost {
+    fs: Rc<dyn Fs>,
+    cwd: String,
+}
+
+impl ParseConfigHost for ConfigHost {
+    fn fs(&self) -> Rc<dyn Fs> {
+        self.fs.clone()
+    }
+
+    fn get_current_directory(&self) -> String {
+        self.cwd.clone()
+    }
+}
+
+/// A new version of `config` with the `goport` options, made only with the
+/// public API of an embedder that builds its own frontend program: the
+/// parsed config, a new compiler host, `new_program`,
+/// `program::mark_freeable_parses` and `new_program_version(&np, None)`.
+fn rebuild(config: &str) -> &'static GoProgram {
+    let _scope = enter_program(None);
+    let cwd = std::env::current_dir().expect("no current directory");
+    let cwd = normalize_path(&cwd.to_string_lossy());
+    let fs = bundled::wrap_fs(osvfs_fs());
+    let host = ConfigHost {
+        fs: fs.clone(),
+        cwd: cwd.clone(),
+    };
+    let mut command_line = CompilerOptions::default();
+    goport_options(&mut command_line);
+    let (parsed, errors) = get_parsed_command_line_of_config_file(
+        &resolve_path(&cwd, &[config]),
+        Some(&command_line),
+        None,
+        &host,
+        None,
+    );
+    assert!(errors.is_empty(), "config {config} has errors");
+    let parsed = parsed.unwrap_or_else(|| panic!("cannot parse {config}"));
+    let np = Rc::new(new_program(ProgramOptions {
+        host: new_compiler_host(&cwd, fs, &bundled::lib_path(), None, None, None),
+        config: Rc::new(parsed),
+        use_source_of_project_reference: false,
+        single_threaded: Tristate::True,
+        typings_location: String::new(),
+        project_name: String::new(),
+        create_module_resolver: None,
+        skip_module_resolution: false,
+    }));
+    mark_freeable_parses(&np);
+    new_program_version(&np, None)
 }
 
 /// The `goport` command line edits: `--noEmit --pretty false`.
