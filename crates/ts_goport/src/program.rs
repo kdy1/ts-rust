@@ -2720,7 +2720,17 @@ pub fn new_program_version(
 /// holder (`ast/file_version.rs`). Call it on the loading thread before
 /// `new_program_version(np, ..)`. Does nothing while
 /// `ast::free_file_versions` is off. `tsc --watch` calls it for each build.
-pub(crate) fn mark_freeable_parses(np: &crate::frontend::compiler::NewProgram) {
+///
+/// A multi-program embedder that builds each `np` itself with
+/// `frontend::compiler::new_program` (for example, a tool that loads its
+/// project again after in-memory edits) calls it the same way. Without it,
+/// every parse of such a rebuild stays in the leaked AST arena. To free the
+/// nodes too, and not only the stores, the process also needs owned nodes:
+/// `ast::set_watch_process` turns on both, as `GOPORT_FREE_FILE_VERSIONS=1`
+/// and `GOPORT_OWNED_NODES=1` do. `goport_multiprog rebuilds` checks this
+/// path.
+// PORT: not in Go. Go frees an old `*ast.SourceFile` with its GC.
+pub fn mark_freeable_parses(np: &crate::frontend::compiler::NewProgram) {
     go_frontend::mark_freeable_parses(np);
 }
 
